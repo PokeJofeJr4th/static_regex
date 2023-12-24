@@ -258,6 +258,7 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
             let mut min = None;
             let mut int_buf = 0;
             loop {
+                *idx += 1;
                 match chars_iter.next() {
                     Some(',') => {
                         if min.is_some() {
