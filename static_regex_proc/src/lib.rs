@@ -20,19 +20,70 @@ fn get_hash(h: &impl Hash) -> u64 {
 
 #[proc_macro]
 pub fn static_regex(input: TokenStream) -> TokenStream {
-    let regex = parse_macro_input!(input as RegexRepr);
+    let mut regex = parse_macro_input!(input as RegexRepr);
     println!("{regex:?}");
-    let mut hash_state = get_hash(&regex);
+    let hash_state = get_hash(&regex);
     let mut fn_body = quote! {
         let mut idx: usize = 0;
     };
-    for segment in regex.body {
-        hash_state = get_hash(&(hash_state ^ get_hash(&segment)));
-        fn_body.extend(segment.compile(hash_state, quote! {return false;}, regex.span));
+    if regex.body.len() >= 2 {
+        if let (Some(Segment::Str(end)), Some(Segment::End)) =
+            (regex.body.get(regex.body.len() - 2), regex.body.last())
+        {
+            // check if the string ends with the given string
+            fn_body.extend(quote! {
+                if !src.ends_with(#end) {
+                    return false;
+                }
+            });
+            regex.body.pop();
+            regex.body.pop();
+        } else if let (Some(Segment::Char(Character::Char(end))), Some(Segment::End)) =
+            (regex.body.get(regex.body.len() - 2), regex.body.last())
+        {
+            // check if the string ends with the given character
+            fn_body.extend(quote! {
+                if !src.ends_with(#end) {
+                    return false;
+                }
+            });
+            regex.body.pop();
+            regex.body.pop();
+        }
     }
-    fn_body.extend(quote! {true});
+    if regex.body.get(0) == Some(&Segment::Start) {
+        regex.body.remove(0);
+        if let Some(Segment::Str(start)) = regex.body.get(0) {
+            // check if the string starts with the given string
+            let str_len = start.len();
+            fn_body.extend(quote! {
+                if !src.starts_with(#start) {
+                    return false;
+                }
+                idx += #str_len;
+            });
+            regex.body.remove(0);
+        } else if let Some(Segment::Char(Character::Char(start))) = regex.body.get(0) {
+            // check if the string starts with the given character
+            fn_body.extend(quote! {
+                if !src.starts_with(#start) {
+                    return false;
+                }
+                idx += 1;
+            });
+            regex.body.remove(0);
+        }
+    } else {
+        todo!()
+    }
+    fn_body.extend(if regex.body.is_empty() {
+        quote! {}
+    } else {
+        let start = regex.body.remove(0);
+        start.compile(hash_state, quote! {return false;}, regex.span, regex.body)
+    });
     quote! {::static_regex::Regex::from_fn(
-        |src| {#fn_body}
+        |src| {#fn_body true}
     )}
     .into()
 }
@@ -75,17 +126,72 @@ impl Parse for RegexRepr {
             if let (Some(Segment::Str(lhs)), &Segment::Char(Character::Char(rhs))) =
                 (body.last_mut(), &segment)
             {
+                // if the next segment is a regular character and the previous is a string, append them
                 lhs.push(rhs);
-            } else if let (
+                continue;
+            }
+            if let (
                 Some(&Segment::Char(Character::Char(lhs))),
                 &Segment::Char(Character::Char(rhs)),
             ) = (body.last(), &segment)
             {
+                // if both the current and next segments are chars, make a new string
                 body.pop();
                 body.push(Segment::Str(format!("{lhs}{rhs}")));
-            } else {
-                body.push(segment);
+                continue;
             }
+            if let (
+                Some(Segment::Str(lhs)),
+                Segment::Quantified(
+                    rhs,
+                    Quantity {
+                        min: min @ 1..,
+                        max,
+                    },
+                ),
+            ) = (body.last_mut(), &segment)
+            {
+                if let &Segment::Char(Character::Char(rhs_c)) = &**rhs {
+                    // `ab+` => `abb*`
+                    for _ in 0..*min {
+                        lhs.push(rhs_c);
+                    }
+                    body.push(Segment::Quantified(
+                        rhs.clone(),
+                        Quantity {
+                            min: 0,
+                            max: max - min,
+                        },
+                    ));
+                    continue;
+                }
+            }
+
+            if let (
+                Some(Segment::Quantified(
+                    lhs,
+                    Quantity {
+                        min: min @ 1..,
+                        max,
+                    },
+                )),
+                Segment::Str(_),
+            ) = (body.last_mut(), &segment)
+            {
+                // `a+bc` => `a*abc`
+                if let Segment::Str(lhs) = &**lhs {
+                    let Segment::Str(mut rhs) = segment else { unreachable!() };
+                    *max -= *min;
+                    for _ in 0..*min {
+                        rhs.push_str(lhs);
+                    }
+                    *min = 0;
+                    body.push(Segment::Str(rhs));
+                    continue;
+                }
+            }
+
+            body.push(segment);
         }
         Ok(Self { body, span })
     }
@@ -147,11 +253,48 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                 },
             ))
         }
+        Some('{') => {
+            *idx += 1;
+            let mut min = None;
+            let mut int_buf = 0;
+            loop {
+                match chars_iter.next() {
+                    Some(',') => {
+                        if min.is_some() {
+                            return Err(RegexErr::BadEscape(','));
+                        } else {
+                            min = Some(int_buf);
+                            int_buf = 0;
+                        }
+                    }
+                    Some('}') => break,
+                    Some(c) if c.is_ascii_digit() => {
+                        int_buf *= 10;
+                        int_buf += c.to_string().parse::<usize>().unwrap();
+                    }
+                    Some(c) => return Err(RegexErr::BadEscape(c)),
+                    None => return Err(RegexErr::UnexpectedEof),
+                }
+            }
+            match min {
+                Some(min) => Ok(Segment::Quantified(
+                    Box::new(v),
+                    Quantity { min, max: int_buf },
+                )),
+                None => Ok(Segment::Quantified(
+                    Box::new(v),
+                    Quantity {
+                        min: int_buf,
+                        max: int_buf,
+                    },
+                )),
+            }
+        }
         _ => Ok(v),
     }
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, PartialEq, Clone)]
 enum Segment {
     Str(String),
     Char(Character),
@@ -162,15 +305,29 @@ enum Segment {
 }
 
 impl Segment {
-    pub fn compile(&self, hash_state: u64, on_else: TokenStream2, span: Span2) -> TokenStream2 {
+    pub fn compile(
+        &self,
+        hash_state: u64,
+        on_else: TokenStream2,
+        span: Span2,
+        mut next: Vec<Self>,
+    ) -> TokenStream2 {
+        let hash_state = get_hash(&(hash_state ^ get_hash(self)));
         match self {
             Self::Char(c) => {
-                let c_comp = c.compile(hash_state);
+                let next = if next.is_empty() {
+                    quote! {}
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(hash_state, on_else.clone(), span, next)
+                };
+                let c_comp = c.compile();
                 quote! {
                     if !(#c_comp) {
                         #on_else
                     }
                     idx += 1;
+                    #next
                 }
             }
             Self::Group(g) => todo!(),
@@ -180,30 +337,55 @@ impl Segment {
                 let min_iters = if *min == 0 {
                     quote! {}
                 } else {
-                    let compile_ret = s.compile(hash_state, on_else, span);
+                    let compile_ret = s.compile(hash_state, on_else.clone(), span, Vec::new());
                     quote! {
                         for _ in 0..#min {
                             #compile_ret
                         }
                     }
                 };
-                let idx_ident = syn::Ident::new(&format!("idx_{hash_state:x}"), span);
+                let idx_ident = syn::Ident::new(&format!("matches_{hash_state:x}"), span);
                 let loop_label = syn::Lifetime::new(&format!("'loop_{hash_state:x}"), span);
-                let compile_break = s.compile(hash_state, quote! {break #loop_label;}, span);
-                quote! {
-                    #min_iters
-                    let mut #idx_ident: usize = 0;
-                    #loop_label: for _ in 0..#max {
-                        #idx_ident = idx;
-                        #compile_break
+                let compile_break =
+                    s.compile(hash_state, quote! {break #loop_label;}, span, Vec::new());
+                let next = if next.is_empty() {
+                    quote! {}
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(hash_state, quote! {continue #loop_label;}, span, next)
+                };
+                if max == 0 {
+                    min_iters
+                } else {
+                    quote! {
+                        #min_iters
+                        let mut #idx_ident: Vec<usize> = Vec::new();
+                        #loop_label: for _ in 0..#max {
+                            #idx_ident.push(idx);
+                            #compile_break
+                        }
+                        if #idx_ident.last() != Some(&idx) {
+                            #idx_ident.push(idx);
+                        }
+                        #loop_label: for i in #idx_ident.into_iter().rev() {
+                            idx = i;
+                            #next
+                            return true;
+                        }
+                        #on_else
                     }
-                    idx = #idx_ident;
                 }
             }
             Self::Str(s) => {
                 let strlen = s.len();
                 let c_ident = syn::Ident::new(&format!("c_{hash_state:x}"), span);
                 let char_iter_ident = syn::Ident::new(&format!("src_iter_{hash_state:x}"), span);
+                let next = if next.is_empty() {
+                    quote! {}
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(hash_state, on_else.clone(), span, next)
+                };
                 quote! {
                     let mut #char_iter_ident = src.chars().skip(idx);
                     for #c_ident in #s.chars() {
@@ -212,33 +394,48 @@ impl Segment {
                         }
                     }
                     idx += #strlen;
+                    #next
                 }
             }
             Self::Start => {
+                let next = if next.is_empty() {
+                    quote! {}
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(hash_state, on_else.clone(), span, next)
+                };
                 quote! {
                     if idx != 0 {
-                        return false;
+                        #on_else
                     }
+                    #next
                 }
             }
             Self::End => {
+                let next = if next.is_empty() {
+                    quote! {}
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(hash_state, on_else.clone(), span, next)
+                };
                 quote! {
                     if idx < src.len() {
-                        return false;
+                        #on_else
                     }
+                    #next
                 }
             }
         }
     }
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 struct Quantity {
     min: usize,
     max: usize,
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 enum Character {
     Char(char),
     Any,
@@ -252,7 +449,7 @@ enum Character {
 }
 
 impl Character {
-    pub fn compile(&self, hash_state: u64) -> TokenStream2 {
+    pub fn compile(&self) -> TokenStream2 {
         let src_nth = quote! {src.chars().nth(idx)};
         match self {
             Self::Char(c) => quote! {#src_nth == Some(#c)},
