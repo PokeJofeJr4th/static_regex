@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery)]
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -8,7 +9,7 @@ use proc_macro2::{Span as Span2, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Expr, ExprLit, Lit,
+    parse_macro_input, Expr, ExprLit, Lit, LitByteStr,
 };
 
 fn get_hash(h: &impl Hash) -> u64 {
@@ -17,6 +18,13 @@ fn get_hash(h: &impl Hash) -> u64 {
     state.finish()
 }
 
+fn vecu8_to_tokens(v: &[u8], span: Span2) -> TokenStream2 {
+    let str_version = LitByteStr::new(v, span);
+    quote! {#str_version}
+}
+
+/// # Panics
+/// uhh
 #[proc_macro]
 pub fn static_regex(input: TokenStream) -> TokenStream {
     let mut regex = parse_macro_input!(input as RegexRepr);
@@ -31,8 +39,9 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
             (regex.body.get(regex.body.len() - 2), regex.body.last())
         {
             // check if the string ends with the given string
+            let end_lit = String::from_utf8_lossy(end);
             fn_body.extend(quote! {
-                if !src.ends_with(#end) {
+                if !src.ends_with(#end_lit) {
                     return false;
                 }
             });
@@ -44,8 +53,9 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
             (regex.body.get(regex.body.len() - 2), regex.body.last())
         {
             // check if the string ends with the given character
+            let end_lit = char::from_u32(u32::from(*end)).unwrap();
             fn_body.extend(quote! {
-                if !src.ends_with(#end) {
+                if !src.ends_with(#end_lit) {
                     return false;
                 }
             });
@@ -60,8 +70,9 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
         if let Some(Segment::Str(start)) = regex.body.get(0) {
             // check if the string starts with the given string
             let str_len = start.len();
+            let start_lit = String::from_utf8_lossy(start);
             fn_body.extend(quote! {
-                if !src.starts_with(#start) {
+                if !src.starts_with(#start_lit) {
                     return false;
                 }
                 idx += #str_len;
@@ -69,27 +80,31 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
             regex.body.remove(0);
         } else if let Some(Segment::Char(Character::Char(start))) = regex.body.get(0) {
             // check if the string starts with the given character
+            let start_lit = char::from_u32(u32::from(*start)).unwrap();
             fn_body.extend(quote! {
-                if !src.starts_with(#start) {
+                if !src.starts_with(#start_lit) {
                     return false;
                 }
                 idx += 1;
             });
             regex.body.remove(0);
         }
-        fn_body.extend(if regex.body.is_empty() {
-            quote! {true}
+        if regex.body.is_empty() {
+            fn_body.extend(quote! {true});
         } else {
             let start = regex.body.remove(0);
-            start.compile(
+            fn_body.extend(quote! {
+                let src: Vec<u8> = src.bytes().collect();
+            });
+            fn_body.extend(start.compile(
                 hash_state,
                 quote! {return false;},
                 quote! {return true;},
                 regex.span,
                 end_len,
                 regex.body,
-            )
-        });
+            ));
+        }
     } else {
         todo!()
     }
@@ -151,7 +166,7 @@ impl Parse for RegexRepr {
             {
                 // if both the current and next segments are chars, make a new string
                 body.pop();
-                body.push(Segment::Str(format!("{lhs}{rhs}")));
+                body.push(Segment::Str([lhs, rhs].into()));
                 continue;
             }
             if let (
@@ -197,7 +212,7 @@ impl Parse for RegexRepr {
                     let Segment::Str(mut rhs) = segment else { unreachable!() };
                     *max -= *min;
                     for _ in 0..*min {
-                        rhs.push_str(lhs);
+                        rhs.extend(lhs);
                     }
                     *min = 0;
                     body.push(Segment::Str(rhs));
@@ -223,12 +238,12 @@ fn get_initial_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                 Some('W') => Ok(Segment::Char(Character::NonWord)),
                 Some('d') => Ok(Segment::Char(Character::Digit)),
                 Some('D') => Ok(Segment::Char(Character::NonDigit)),
-                Some('n') => Ok(Segment::Char(Character::Char('\n'))),
-                Some('t') => Ok(Segment::Char(Character::Char('\t'))),
+                Some('n') => Ok(Segment::Str((*b"\n").into())),
+                Some('t') => Ok(Segment::Str((*b"\t").into())),
                 Some(
                     c @ ('\\' | '(' | ')' | '{' | '}' | '[' | ']' | '+' | '*' | '?' | '.' | '^'
                     | '$'),
-                ) => Ok(Segment::Char(Character::Char(c))),
+                ) => Ok(Segment::Char(Character::Char(c.try_into().unwrap()))),
                 Some(c) => Err(RegexErr::BadEscape(c)),
                 None => Err(RegexErr::UnexpectedEof),
             }
@@ -247,7 +262,8 @@ fn get_initial_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
             }
             Ok(Segment::Group(sections))
         }
-        Some(c) => Ok(Segment::Char(Character::Char(c))),
+        Some(c @ (')' | '{' | '}' | ']' | '+' | '*' | '?')) => Err(RegexErr::BadEscape(c)),
+        Some(c) => Ok(Segment::Char(Character::Char(c.try_into().unwrap()))),
         None => Err(RegexErr::UnexpectedEof),
     }?;
     *idx += 1;
@@ -295,10 +311,9 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                     Some(',') => {
                         if min.is_some() {
                             return Err(RegexErr::BadEscape(','));
-                        } else {
-                            min = Some(int_buf);
-                            int_buf = 0;
                         }
+                        min = Some(int_buf);
+                        int_buf = 0;
                     }
                     Some('}') => break,
                     Some(c) if c.is_ascii_digit() => {
@@ -329,7 +344,7 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
 
 #[derive(Debug, Hash, PartialEq, Clone)]
 enum Segment {
-    Str(String),
+    Str(Vec<u8>),
     Char(Character),
     Quantified(Box<Segment>, Quantity),
     Group(Vec<Segment>),
@@ -338,6 +353,7 @@ enum Segment {
 }
 
 impl Segment {
+    #[allow(clippy::too_many_lines)]
     pub fn compile(
         &self,
         hash_state: u64,
@@ -353,8 +369,8 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
                         hash_state,
                         on_fail.clone(),
                         on_success,
@@ -376,8 +392,8 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
                         hash_state,
                         on_fail.clone(),
                         on_success,
@@ -431,15 +447,26 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
-                        hash_state,
-                        quote! {continue #loop_label;},
-                        on_success,
-                        span,
-                        end_length,
-                        next,
-                    )
+                    let next_segment = next.remove(0);
+                    if next_segment == Self::End {
+                        next_segment.compile(
+                            hash_state,
+                            on_fail.clone(),
+                            on_success,
+                            span,
+                            end_length,
+                            next,
+                        )
+                    } else {
+                        next_segment.compile(
+                            hash_state,
+                            quote! {continue #loop_label;},
+                            on_success,
+                            span,
+                            end_length,
+                            next,
+                        )
+                    }
                 };
                 if max == 0 {
                     min_iters
@@ -469,8 +496,8 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
                         hash_state,
                         on_fail.clone(),
                         on_success,
@@ -479,10 +506,11 @@ impl Segment {
                         next,
                     )
                 };
+                let s_bytes = vecu8_to_tokens(s, span);
                 quote! {
-                    let mut #char_iter_ident = src.chars().skip(idx);
-                    for #c_ident in #s.chars() {
-                        if #char_iter_ident.next() != Some(#c_ident) {
+                    let mut #char_iter_ident = src.iter().skip(idx);
+                    for #c_ident in #s_bytes {
+                        if #char_iter_ident.next() != Some(&#c_ident) {
                             #on_fail
                         }
                     }
@@ -494,8 +522,8 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
                         hash_state,
                         on_fail.clone(),
                         on_success,
@@ -515,8 +543,8 @@ impl Segment {
                 let next = if next.is_empty() {
                     on_success
                 } else {
-                    let nxt = next.remove(0);
-                    nxt.compile(
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
                         hash_state,
                         on_fail.clone(),
                         on_success,
@@ -544,7 +572,7 @@ struct Quantity {
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 enum Character {
-    Char(char),
+    Char(u8),
     Any,
     Range(char, char),
     Space,
@@ -556,10 +584,10 @@ enum Character {
 }
 
 impl Character {
-    pub fn compile(&self) -> TokenStream2 {
-        let src_nth = quote! {src.chars().nth(idx)};
+    pub fn compile(self) -> TokenStream2 {
+        let src_nth = quote! {src.get(idx)};
         match self {
-            Self::Char(c) => quote! {#src_nth == Some(#c)},
+            Self::Char(c) => quote! {#src_nth == Some(&#c)},
             Self::Any => quote! {true},
             Self::Range(l, r) => quote! {#src_nth.is_some_and(|c| #l <= c && #r >= c)},
             Self::Space => quote! {#src_nth.is_some_and(char::is_whitespace)},
