@@ -25,6 +25,7 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
     let mut fn_body = quote! {
         let mut idx: usize = 0;
     };
+    let mut end_len = 0;
     if regex.body.len() >= 2 {
         if let (Some(Segment::Str(end)), Some(Segment::End)) =
             (regex.body.get(regex.body.len() - 2), regex.body.last())
@@ -35,8 +36,10 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                     return false;
                 }
             });
+            end_len = end.len();
             regex.body.pop();
             regex.body.pop();
+            regex.body.push(Segment::End);
         } else if let (Some(Segment::Char(Character::Char(end))), Some(Segment::End)) =
             (regex.body.get(regex.body.len() - 2), regex.body.last())
         {
@@ -48,6 +51,8 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
             });
             regex.body.pop();
             regex.body.pop();
+            regex.body.push(Segment::End);
+            end_len = 1;
         }
     }
     if regex.body.get(0) == Some(&Segment::Start) {
@@ -81,6 +86,7 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                 quote! {return false;},
                 quote! {return true;},
                 regex.span,
+                end_len,
                 regex.body,
             )
         });
@@ -121,7 +127,7 @@ impl Parse for RegexRepr {
             attrs: _,
             lit: Lit::Str(lit_str),
         }) = input.parse()? else {
-            panic!()
+            panic!("Expected a string literal")
         };
 
         let s = lit_str.value();
@@ -205,7 +211,7 @@ impl Parse for RegexRepr {
     }
 }
 
-fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
+fn get_initial_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
     let mut chars_iter = s.chars();
     let v = match chars_iter.nth(*idx) {
         Some('\\') => {
@@ -219,9 +225,10 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                 Some('D') => Ok(Segment::Char(Character::NonDigit)),
                 Some('n') => Ok(Segment::Char(Character::Char('\n'))),
                 Some('t') => Ok(Segment::Char(Character::Char('\t'))),
-                Some(c @ ('\\' | '(' | ')' | '{' | '}' | '[' | ']' | '+' | '*' | '?' | '.')) => {
-                    Ok(Segment::Char(Character::Char(c)))
-                }
+                Some(
+                    c @ ('\\' | '(' | ')' | '{' | '}' | '[' | ']' | '+' | '*' | '?' | '.' | '^'
+                    | '$'),
+                ) => Ok(Segment::Char(Character::Char(c))),
                 Some(c) => Err(RegexErr::BadEscape(c)),
                 None => Err(RegexErr::UnexpectedEof),
             }
@@ -229,10 +236,27 @@ fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
         Some('^') => Ok(Segment::Start),
         Some('$') => Ok(Segment::End),
         Some('.') => Ok(Segment::Char(Character::Any)),
+        Some('(') => {
+            let mut sections = Vec::new();
+            *idx += 1;
+            loop {
+                if s.chars().nth(*idx) == Some(')') {
+                    break;
+                }
+                sections.push(get_regex_section(s, idx)?);
+            }
+            Ok(Segment::Group(sections))
+        }
         Some(c) => Ok(Segment::Char(Character::Char(c))),
         None => Err(RegexErr::UnexpectedEof),
     }?;
     *idx += 1;
+    Ok(v)
+}
+
+fn get_regex_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
+    let v = get_initial_section(s, idx)?;
+    let mut chars_iter = s.chars().skip(*idx);
     match chars_iter.next() {
         Some('+') => {
             *idx += 1;
@@ -320,6 +344,7 @@ impl Segment {
         on_fail: TokenStream2,
         on_success: TokenStream2,
         span: Span2,
+        end_length: usize,
         mut next: Vec<Self>,
     ) -> TokenStream2 {
         let hash_state = get_hash(&(hash_state ^ get_hash(self)));
@@ -329,7 +354,14 @@ impl Segment {
                     on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
+                    nxt.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
                 };
                 let c_comp = c.compile();
                 quote! {
@@ -340,15 +372,46 @@ impl Segment {
                     #next
                 }
             }
-            Self::Group(g) => todo!(),
+            Self::Group(g) => {
+                let next = if next.is_empty() {
+                    on_success
+                } else {
+                    let nxt = next.remove(0);
+                    nxt.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
+                };
+                let mut g = g.clone();
+                let fn_body = if g.is_empty() {
+                    quote! {}
+                } else {
+                    let start = g.remove(0);
+                    start.compile(hash_state, on_fail, quote! {}, span, end_length, g)
+                };
+                quote! {
+                    #fn_body
+                    #next
+                }
+            }
             Self::Quantified(s, q) => {
                 let Quantity { min, max } = q;
                 let max = max - min;
                 let min_iters = if *min == 0 {
                     quote! {}
                 } else {
-                    let compile_ret =
-                        s.compile(hash_state, on_fail.clone(), quote! {}, span, Vec::new());
+                    let compile_ret = s.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        quote! {},
+                        span,
+                        end_length,
+                        Vec::new(),
+                    );
                     quote! {
                         for _ in 0..#min {
                             #compile_ret
@@ -362,6 +425,7 @@ impl Segment {
                     quote! {break #loop_label;},
                     quote! {},
                     span,
+                    end_length,
                     Vec::new(),
                 );
                 let next = if next.is_empty() {
@@ -373,6 +437,7 @@ impl Segment {
                         quote! {continue #loop_label;},
                         on_success,
                         span,
+                        end_length,
                         next,
                     )
                 };
@@ -405,7 +470,14 @@ impl Segment {
                     on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
+                    nxt.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
                 };
                 quote! {
                     let mut #char_iter_ident = src.chars().skip(idx);
@@ -423,7 +495,14 @@ impl Segment {
                     on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
+                    nxt.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
                 };
                 quote! {
                     if idx != 0 {
@@ -437,10 +516,17 @@ impl Segment {
                     on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
+                    nxt.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
                 };
                 quote! {
-                    if idx < src.len() {
+                    if idx + #end_length < src.len() {
                         #on_fail
                     }
                     #next
