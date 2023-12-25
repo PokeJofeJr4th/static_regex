@@ -1,7 +1,7 @@
 use static_regex::Regex;
 use static_regex_proc::static_regex;
 
-const X: Regex = static_regex!("^tra+ins*$");
+const TRAINS: Regex = static_regex!("^tra+ins*$");
 
 fn main() {
     for s in [
@@ -12,6 +12,6 @@ fn main() {
         "traaaainssssssssss",
         "train!",
     ] {
-        println!("{s}: {}", X.matches(s))
+        println!("{s}: {}", TRAINS.matches(s))
     }
 }

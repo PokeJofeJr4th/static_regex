@@ -1,15 +1,14 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    str::FromStr,
 };
 
-use proc_macro::{Literal, Span, TokenStream, TokenTree};
+use proc_macro::TokenStream;
 use proc_macro2::{Span as Span2, TokenStream as TokenStream2};
-use quote::{quote, quote_spanned, TokenStreamExt};
+use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Expr, ExprLit, Ident, Lit,
+    parse_macro_input, Expr, ExprLit, Lit,
 };
 
 fn get_hash(h: &impl Hash) -> u64 {
@@ -73,18 +72,27 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
             });
             regex.body.remove(0);
         }
+        fn_body.extend(if regex.body.is_empty() {
+            quote! {true}
+        } else {
+            let start = regex.body.remove(0);
+            start.compile(
+                hash_state,
+                quote! {return false;},
+                quote! {return true;},
+                regex.span,
+                regex.body,
+            )
+        });
     } else {
         todo!()
     }
-    fn_body.extend(if regex.body.is_empty() {
-        quote! {}
-    } else {
-        let start = regex.body.remove(0);
-        start.compile(hash_state, quote! {return false;}, regex.span, regex.body)
-    });
-    quote! {::static_regex::Regex::from_fn(
-        |src| {#fn_body true}
-    )}
+    quote! {{
+        #[allow(dead_code)]
+        ::static_regex::Regex::from_fn(
+            |src| {#fn_body}
+        )
+    }}
     .into()
 }
 
@@ -309,7 +317,8 @@ impl Segment {
     pub fn compile(
         &self,
         hash_state: u64,
-        on_else: TokenStream2,
+        on_fail: TokenStream2,
+        on_success: TokenStream2,
         span: Span2,
         mut next: Vec<Self>,
     ) -> TokenStream2 {
@@ -317,15 +326,15 @@ impl Segment {
         match self {
             Self::Char(c) => {
                 let next = if next.is_empty() {
-                    quote! {}
+                    on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_else.clone(), span, next)
+                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
                 };
                 let c_comp = c.compile();
                 quote! {
                     if !(#c_comp) {
-                        #on_else
+                        #on_fail
                     }
                     idx += 1;
                     #next
@@ -338,7 +347,8 @@ impl Segment {
                 let min_iters = if *min == 0 {
                     quote! {}
                 } else {
-                    let compile_ret = s.compile(hash_state, on_else.clone(), span, Vec::new());
+                    let compile_ret =
+                        s.compile(hash_state, on_fail.clone(), quote! {}, span, Vec::new());
                     quote! {
                         for _ in 0..#min {
                             #compile_ret
@@ -347,13 +357,24 @@ impl Segment {
                 };
                 let idx_ident = syn::Ident::new(&format!("matches_{hash_state:x}"), span);
                 let loop_label = syn::Lifetime::new(&format!("'loop_{hash_state:x}"), span);
-                let compile_break =
-                    s.compile(hash_state, quote! {break #loop_label;}, span, Vec::new());
+                let compile_break = s.compile(
+                    hash_state,
+                    quote! {break #loop_label;},
+                    quote! {},
+                    span,
+                    Vec::new(),
+                );
                 let next = if next.is_empty() {
-                    quote! {}
+                    on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, quote! {continue #loop_label;}, span, next)
+                    nxt.compile(
+                        hash_state,
+                        quote! {continue #loop_label;},
+                        on_success,
+                        span,
+                        next,
+                    )
                 };
                 if max == 0 {
                     min_iters
@@ -371,9 +392,8 @@ impl Segment {
                         #loop_label: for i in #idx_ident.into_iter().rev() {
                             idx = i;
                             #next
-                            return true;
                         }
-                        #on_else
+                        #on_fail
                     }
                 }
             }
@@ -382,16 +402,16 @@ impl Segment {
                 let c_ident = syn::Ident::new(&format!("c_{hash_state:x}"), span);
                 let char_iter_ident = syn::Ident::new(&format!("src_iter_{hash_state:x}"), span);
                 let next = if next.is_empty() {
-                    quote! {}
+                    on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_else.clone(), span, next)
+                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
                 };
                 quote! {
                     let mut #char_iter_ident = src.chars().skip(idx);
                     for #c_ident in #s.chars() {
                         if #char_iter_ident.next() != Some(#c_ident) {
-                            #on_else
+                            #on_fail
                         }
                     }
                     idx += #strlen;
@@ -400,28 +420,28 @@ impl Segment {
             }
             Self::Start => {
                 let next = if next.is_empty() {
-                    quote! {}
+                    on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_else.clone(), span, next)
+                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
                 };
                 quote! {
                     if idx != 0 {
-                        #on_else
+                        #on_fail
                     }
                     #next
                 }
             }
             Self::End => {
                 let next = if next.is_empty() {
-                    quote! {}
+                    on_success
                 } else {
                     let nxt = next.remove(0);
-                    nxt.compile(hash_state, on_else.clone(), span, next)
+                    nxt.compile(hash_state, on_fail.clone(), on_success, span, next)
                 };
                 quote! {
                     if idx < src.len() {
-                        #on_else
+                        #on_fail
                     }
                     #next
                 }
