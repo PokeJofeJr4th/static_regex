@@ -429,84 +429,87 @@ impl Segment {
                         next,
                     )
                 };
-                let mut g = g.clone();
-                let fn_body = if g.is_empty() {
-                    quote! {}
+                if g.is_empty() {
+                    next
                 } else {
-                    let start = g.remove(0);
-                    start.compile(hash_state, on_fail, quote! {}, span, end_length, g)
-                };
-                quote! {
-                    #fn_body
-                    #next
+                    let mut group = g.clone();
+                    let start = group.remove(0);
+                    start.compile(hash_state, on_fail, next, span, end_length, group)
                 }
             }
             Self::Quantified(s, q) => {
                 let Quantity { min, max } = q;
                 let max = max - min;
+                let loop_label = syn::Lifetime::new(&format!("'loop_{hash_state:x}"), span);
                 let min_iters = if *min == 0 {
                     quote! {}
                 } else {
                     let compile_ret = s.compile(
                         hash_state,
                         on_fail.clone(),
-                        quote! {},
+                        quote! {continue #loop_label;},
                         span,
                         end_length,
                         Vec::new(),
                     );
                     quote! {
-                        for _ in 0..#min {
+                        #loop_label: for _ in 0..#min {
                             #compile_ret
                         }
                     }
                 };
                 let idx_ident = syn::Ident::new(&format!("matches_{hash_state:x}"), span);
-                let loop_label = syn::Lifetime::new(&format!("'loop_{hash_state:x}"), span);
                 let compile_break = s.compile(
                     hash_state,
                     quote! {break #loop_label;},
-                    quote! {},
+                    quote! {continue #loop_label;},
                     span,
                     end_length,
                     Vec::new(),
                 );
-                let next = if next.is_empty() {
-                    on_success
-                } else {
-                    let next_segment = next.remove(0);
-                    if next_segment == Self::End {
-                        next_segment.compile(
-                            hash_state,
-                            on_fail.clone(),
-                            on_success,
-                            span,
-                            end_length,
-                            next,
-                        )
-                    } else {
-                        next_segment.compile(
-                            hash_state,
-                            quote! {continue #loop_label;},
-                            on_success,
-                            span,
-                            end_length,
-                            next,
-                        )
-                    }
-                };
                 if max == 0 {
-                    min_iters
+                    let next = if next.is_empty() {
+                        on_success
+                    } else {
+                        let next_segment = next.remove(0);
+                        next_segment
+                            .compile(hash_state, on_fail, on_success, span, end_length, next)
+                    };
+                    quote! {
+                        #min_iters
+                        #next
+                    }
                 } else {
+                    let next = if next.is_empty() {
+                        on_success
+                    } else {
+                        let next_segment = next.remove(0);
+                        if next_segment == Self::End {
+                            next_segment.compile(
+                                hash_state,
+                                on_fail.clone(),
+                                on_success,
+                                span,
+                                end_length,
+                                next,
+                            )
+                        } else {
+                            next_segment.compile(
+                                hash_state,
+                                quote! {continue #loop_label;},
+                                on_success,
+                                span,
+                                end_length,
+                                next,
+                            )
+                        }
+                    };
                     quote! {
                         #min_iters
                         let mut #idx_ident: Vec<usize> = Vec::new();
                         #loop_label: for _ in 0..#max {
                             #idx_ident.push(idx);
                             #compile_break
-                        }
-                        if #idx_ident.last() != Some(&idx) {
-                            #idx_ident.push(idx);
                         }
                         #loop_label: for i in #idx_ident.into_iter().rev() {
                             idx = i;
@@ -616,13 +619,19 @@ impl Character {
         match self {
             Self::Char(c) => quote! {#src_nth == Some(#c)},
             Self::Any => quote! {true},
-            Self::Range(l, r) => quote! {#src_nth.is_some_and(|c| #l <= c && #r >= c)},
-            Self::Space => quote! {#src_nth.is_some_and(char::is_whitespace)},
-            Self::NonSpace => quote! {#src_nth.is_some_and(|c| !c.is_whitespace())},
-            Self::Word => quote! {#src_nth.is_some_and(char::is_alphanumeric)},
-            Self::NonWord => quote! {#src_nth.is_some_and(|c| !c.is_alphanumeric())},
-            Self::Digit => quote! {#src_nth.is_some_and(char::is_ascii_digit)},
-            Self::NonDigit => quote! {#src_nth.is_some_and(|c| !c.is_ascii_digit())},
+            Self::Range(l, r) => {
+                quote! {#src_nth.map(char::from).is_some_and(|c| #l <= c && #r >= c)}
+            }
+            Self::Space => quote! {#src_nth.map(char::from).is_some_and(|c| c.is_whitespace())},
+            Self::NonSpace => quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_whitespace())},
+            Self::Word => quote! {#src_nth.map(char::from).is_some_and(|c|c.is_alphanumeric())},
+            Self::NonWord => {
+                quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_alphanumeric())}
+            }
+            Self::Digit => quote! {#src_nth.map(char::from).is_some_and(|c| c.is_ascii_digit())},
+            Self::NonDigit => {
+                quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_ascii_digit())}
+            }
         }
     }
 }
