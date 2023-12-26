@@ -19,7 +19,7 @@ fn main() {
         "wololololololololo",
     ] {
         println!(
-            "{s}:\n\ttrain: {}\n\twololo: {}\n\tlol: {}",
+            "{s}:\n\t{TRAINS}: {}\n\t{WOLOLO}: {}\n\t{LOL}: {}",
             TRAINS.is_match(s),
             WOLOLO.is_match(s),
             LOL.is_match(s)

@@ -1,5 +1,5 @@
 #![warn(clippy::pedantic, clippy::nursery)]
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Regex {
@@ -29,8 +29,8 @@ impl Debug for Regex {
     }
 }
 
-impl ToString for Regex {
-    fn to_string(&self) -> String {
-        self.pattern.to_string()
+impl Display for Regex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.pattern)
     }
 }
