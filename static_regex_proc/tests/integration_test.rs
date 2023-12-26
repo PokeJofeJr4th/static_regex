@@ -26,3 +26,19 @@ fn test_quantifier() {
     assert!(re.is_match("111010101010"));
     assert!(!re.is_match("100"));
 }
+
+#[test]
+fn test_word_boundary() {
+    let re = static_regex_proc::static_regex!(r"\bapple\b");
+    assert!(re.is_match("I want an apple"));
+    assert!(re.is_match("apple"));
+    assert!(!re.is_match("Welcome to applebee's!"));
+}
+
+#[test]
+fn test_non_word_boundary() {
+    let re = static_regex_proc::static_regex!(r"\Bball\b");
+    assert!(re.is_match("Basketball"));
+    assert!(!re.is_match("Basketballs"));
+    assert!(!re.is_match("ball"))
+}

@@ -1,7 +1,7 @@
 use static_regex::Regex;
 use static_regex_proc::static_regex;
 
-const TRAINS: Regex = static_regex!("^tra+ins*$");
+const TRAINS: Regex = static_regex!(r"^tra+ins*$");
 const WOLOLO: Regex = static_regex!("^w(ol)+o$");
 const HELLO: Regex = static_regex!("^Hello$");
 const LOL: Regex = static_regex!("lol");

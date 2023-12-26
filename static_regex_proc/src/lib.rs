@@ -1,6 +1,7 @@
 #![warn(clippy::pedantic, clippy::nursery)]
 use std::{
     collections::hash_map::DefaultHasher,
+    fmt::Debug,
     hash::{Hash, Hasher},
 };
 
@@ -29,7 +30,7 @@ fn vecu8_to_tokens(v: &[u8], span: Span2) -> TokenStream2 {
 #[allow(clippy::too_many_lines)]
 pub fn static_regex(input: TokenStream) -> TokenStream {
     let regex = parse_macro_input!(input as RegexRepr);
-    println!("{regex:?}");
+    // println!("{regex:?}");
     let hash_state = get_hash(&regex);
     let RegexRepr {
         mut body,
@@ -130,7 +131,8 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
         });
     }
     quote! {unsafe {
-        #[allow(dead_code, clippy::unused_label)]
+        use ::static_regex::CharacterClasses;
+        #[allow(dead_code, unused_labels)]
         ::static_regex::Regex::new(
             #pattern,
             |src| {#fn_body}
@@ -152,10 +154,18 @@ impl Hash for RegexRepr {
     }
 }
 
-#[derive(Debug)]
 enum RegexErr {
     UnexpectedEof,
     BadEscape(char),
+}
+
+impl Debug for RegexErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedEof => write!(f, "unexpected end of regular expression"),
+            Self::BadEscape(c) => write!(f, "bad escape sequence \"\\{c}\""),
+        }
+    }
 }
 
 impl Parse for RegexRepr {
@@ -265,8 +275,11 @@ fn get_initial_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                 Some('W') => Ok(Segment::Char(Character::NonWord)),
                 Some('d') => Ok(Segment::Char(Character::Digit)),
                 Some('D') => Ok(Segment::Char(Character::NonDigit)),
+                Some('b') => Ok(Segment::Boundary),
+                Some('B') => Ok(Segment::NonBoundary),
                 Some('n') => Ok(Segment::Str((*b"\n").into())),
                 Some('t') => Ok(Segment::Str((*b"\t").into())),
+                Some('r') => Ok(Segment::Str((*b"\r").into())),
                 Some(
                     c @ ('\\' | '(' | ')' | '{' | '}' | '[' | ']' | '+' | '*' | '?' | '.' | '^'
                     | '$'),
@@ -377,6 +390,8 @@ enum Segment {
     Group(Vec<Segment>),
     Start,
     End,
+    Boundary,
+    NonBoundary,
 }
 
 impl Segment {
@@ -590,6 +605,48 @@ impl Segment {
                     #next
                 }
             }
+            Self::Boundary => {
+                let next = if next.is_empty() {
+                    on_success
+                } else {
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
+                };
+                quote! {
+                    if (idx != 0 && src.bytes().nth(idx - 1).unwrap().is_word()) == (src.bytes().nth(idx).unwrap_or(0).is_word()) {
+                        #on_fail
+                    }
+                    #next
+                }
+            }
+            Self::NonBoundary => {
+                let next = if next.is_empty() {
+                    on_success
+                } else {
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
+                };
+                quote! {
+                    if (idx != 0 && src.bytes().nth(idx - 1).unwrap().is_word()) ^ (src.bytes().nth(idx).unwrap_or(0).is_word()) {
+                        #on_fail
+                    }
+                    #next
+                }
+            }
         }
     }
 }
@@ -620,17 +677,19 @@ impl Character {
             Self::Char(c) => quote! {#src_nth == Some(#c)},
             Self::Any => quote! {true},
             Self::Range(l, r) => {
-                quote! {#src_nth.map(char::from).is_some_and(|c| #l <= c && #r >= c)}
+                quote! {#src_nth.is_some_and(|c| #l <= c && #r >= c)}
             }
-            Self::Space => quote! {#src_nth.map(char::from).is_some_and(|c| c.is_whitespace())},
-            Self::NonSpace => quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_whitespace())},
-            Self::Word => quote! {#src_nth.map(char::from).is_some_and(|c|c.is_alphanumeric())},
+            Self::Space => quote! {#src_nth.is_some_and(CharacterClasses::is_space)},
+            Self::NonSpace => quote! {#src_nth.is_some_and(CharacterClasses::is_not_space)},
+            Self::Word => {
+                quote! {#src_nth.is_some_and(CharacterClasses::is_word)}
+            }
             Self::NonWord => {
-                quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_alphanumeric())}
+                quote! {#src_nth.is_some_and(CharacterClasses::is_not_word)}
             }
-            Self::Digit => quote! {#src_nth.map(char::from).is_some_and(|c| c.is_ascii_digit())},
+            Self::Digit => quote! {#src_nth.is_some_and(CharacterClasses::is_digit)},
             Self::NonDigit => {
-                quote! {#src_nth.map(char::from).is_some_and(|c| !c.is_ascii_digit())}
+                quote! {#src_nth.is_some_and(CharacterClasses::is_not_digit)}
             }
         }
     }
