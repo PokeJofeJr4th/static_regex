@@ -24,19 +24,25 @@ fn vecu8_to_tokens(v: &[u8], span: Span2) -> TokenStream2 {
 }
 
 /// # Panics
-/// uhh
+///
 #[proc_macro]
+#[allow(clippy::too_many_lines)]
 pub fn static_regex(input: TokenStream) -> TokenStream {
-    let mut regex = parse_macro_input!(input as RegexRepr);
+    let regex = parse_macro_input!(input as RegexRepr);
     println!("{regex:?}");
     let hash_state = get_hash(&regex);
+    let RegexRepr {
+        mut body,
+        pattern,
+        span,
+    } = regex;
     let mut fn_body = quote! {
         let mut idx: usize = 0;
     };
     let mut end_len = 0;
-    if regex.body.len() >= 2 {
+    if body.len() >= 2 {
         if let (Some(Segment::Str(end)), Some(Segment::End)) =
-            (regex.body.get(regex.body.len() - 2), regex.body.last())
+            (body.get(body.len() - 2), body.last())
         {
             // check if the string ends with the given string
             let end_lit = String::from_utf8_lossy(end);
@@ -46,11 +52,11 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                 }
             });
             end_len = end.len();
-            regex.body.pop();
-            regex.body.pop();
-            regex.body.push(Segment::End);
+            body.pop();
+            body.pop();
+            body.push(Segment::End);
         } else if let (Some(Segment::Char(Character::Char(end))), Some(Segment::End)) =
-            (regex.body.get(regex.body.len() - 2), regex.body.last())
+            (body.get(body.len() - 2), body.last())
         {
             // check if the string ends with the given character
             let end_lit = char::from_u32(u32::from(*end)).unwrap();
@@ -59,15 +65,15 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                     return false;
                 }
             });
-            regex.body.pop();
-            regex.body.pop();
-            regex.body.push(Segment::End);
+            body.pop();
+            body.pop();
+            body.push(Segment::End);
             end_len = 1;
         }
     }
-    if regex.body.get(0) == Some(&Segment::Start) {
-        regex.body.remove(0);
-        if let Some(Segment::Str(start)) = regex.body.get(0) {
+    if body.get(0) == Some(&Segment::Start) {
+        body.remove(0);
+        if let Some(Segment::Str(start)) = body.get(0) {
             // check if the string starts with the given string
             let str_len = start.len();
             let start_lit = String::from_utf8_lossy(start);
@@ -77,8 +83,8 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                 }
                 idx += #str_len;
             });
-            regex.body.remove(0);
-        } else if let Some(Segment::Char(Character::Char(start))) = regex.body.get(0) {
+            body.remove(0);
+        } else if let Some(Segment::Char(Character::Char(start))) = body.get(0) {
             // check if the string starts with the given character
             let start_lit = char::from_u32(u32::from(*start)).unwrap();
             fn_body.extend(quote! {
@@ -87,30 +93,46 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
                 }
                 idx += 1;
             });
-            regex.body.remove(0);
+            body.remove(0);
         }
-        if regex.body.is_empty() {
+        if body.is_empty() {
             fn_body.extend(quote! {true});
         } else {
-            let start = regex.body.remove(0);
-            fn_body.extend(quote! {
-                let src: Vec<u8> = src.bytes().collect();
-            });
+            let start = body.remove(0);
             fn_body.extend(start.compile(
                 hash_state,
                 quote! {return false;},
                 quote! {return true;},
                 regex.span,
                 end_len,
-                regex.body,
+                body,
             ));
         }
+    } else if body.is_empty() {
+        fn_body.extend(quote! {true});
     } else {
-        todo!()
+        let main_loop_label = syn::Lifetime::new(&format!("'_main_loop_{hash_state:x}"), span);
+        let start = body.remove(0);
+        let loop_body = start.compile(
+            hash_state,
+            quote! {continue #main_loop_label;},
+            quote! {return true;},
+            regex.span,
+            end_len,
+            body,
+        );
+        fn_body.extend(quote! {
+            #main_loop_label: for i in 0..src.len() {
+                idx = i;
+                #loop_body
+            }
+            return false;
+        });
     }
-    quote! {{
-        #[allow(dead_code)]
-        ::static_regex::Regex::from_fn(
+    quote! {unsafe {
+        #[allow(dead_code, clippy::unused_label)]
+        ::static_regex::Regex::new(
+            #pattern,
             |src| {#fn_body}
         )
     }}
@@ -120,6 +142,7 @@ pub fn static_regex(input: TokenStream) -> TokenStream {
 #[derive(Debug)]
 struct RegexRepr {
     body: Vec<Segment>,
+    pattern: String,
     span: Span2,
 }
 
@@ -145,13 +168,13 @@ impl Parse for RegexRepr {
             panic!("Expected a string literal")
         };
 
-        let s = lit_str.value();
+        let pattern = lit_str.value();
         let span = lit_str.span();
 
         let mut idx = 0;
         let mut body = Vec::new();
-        while idx < s.len() {
-            let segment = get_regex_section(&s, &mut idx).unwrap();
+        while idx < pattern.len() {
+            let segment = get_regex_section(&pattern, &mut idx).unwrap();
             if let (Some(Segment::Str(lhs)), &Segment::Char(Character::Char(rhs))) =
                 (body.last_mut(), &segment)
             {
@@ -222,7 +245,11 @@ impl Parse for RegexRepr {
 
             body.push(segment);
         }
-        Ok(Self { body, span })
+        Ok(Self {
+            body,
+            pattern,
+            span,
+        })
     }
 }
 
@@ -508,9 +535,9 @@ impl Segment {
                 };
                 let s_bytes = vecu8_to_tokens(s, span);
                 quote! {
-                    let mut #char_iter_ident = src.iter().skip(idx);
-                    for #c_ident in #s_bytes {
-                        if #char_iter_ident.next() != Some(&#c_ident) {
+                    let mut #char_iter_ident = src.bytes().skip(idx);
+                    for &#c_ident in #s_bytes {
+                        if #char_iter_ident.next() != Some(#c_ident) {
                             #on_fail
                         }
                     }
@@ -585,9 +612,9 @@ enum Character {
 
 impl Character {
     pub fn compile(self) -> TokenStream2 {
-        let src_nth = quote! {src.get(idx)};
+        let src_nth = quote! {src.bytes().nth(idx)};
         match self {
-            Self::Char(c) => quote! {#src_nth == Some(&#c)},
+            Self::Char(c) => quote! {#src_nth == Some(#c)},
             Self::Any => quote! {true},
             Self::Range(l, r) => quote! {#src_nth.is_some_and(|c| #l <= c && #r >= c)},
             Self::Space => quote! {#src_nth.is_some_and(char::is_whitespace)},

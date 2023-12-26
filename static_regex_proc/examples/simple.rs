@@ -4,6 +4,7 @@ use static_regex_proc::static_regex;
 const TRAINS: Regex = static_regex!("^tra+ins*$");
 const WOLOLO: Regex = static_regex!("^w(ol)+o$");
 const HELLO: Regex = static_regex!("^Hello$");
+const LOL: Regex = static_regex!("lol");
 
 fn main() {
     for s in [
@@ -17,6 +18,11 @@ fn main() {
         "wolo",
         "wololololololololo",
     ] {
-        println!("{s}: {} {}", TRAINS.matches(s), WOLOLO.matches(s));
+        println!(
+            "{s}:\n\ttrain: {}\n\twololo: {}\n\tlol: {}",
+            TRAINS.is_match(s),
+            WOLOLO.is_match(s),
+            LOL.is_match(s)
+        );
     }
 }
