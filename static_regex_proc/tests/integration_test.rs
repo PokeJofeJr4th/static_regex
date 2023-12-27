@@ -42,3 +42,22 @@ fn test_non_word_boundary() {
     assert!(!re.is_match("Basketballs"));
     assert!(!re.is_match("ball"))
 }
+
+#[test]
+fn test_bracket_group() {
+    let re = static_regex_proc::static_regex!(r"[Ww]ow");
+    assert!(re.is_match("wow"));
+    assert!(re.is_match("Wow"));
+    assert!(!re.is_match("WWW"));
+}
+
+#[test]
+fn test_bracket_range() {
+    let re = static_regex_proc::static_regex!(r"^[1-9]\d*$");
+    assert!(re.is_match("1"));
+    assert!(re.is_match("100"));
+    assert!(!re.is_match("001"));
+    assert!(re.is_match("9"));
+    assert!(re.is_match("900"));
+    assert!(!re.is_match("009"));
+}

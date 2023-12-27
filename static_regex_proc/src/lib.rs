@@ -1,7 +1,7 @@
 #![warn(clippy::pedantic, clippy::nursery)]
 use std::{
     collections::hash_map::DefaultHasher,
-    fmt::Debug,
+    fmt::{Debug, Display},
     hash::{Hash, Hasher},
 };
 
@@ -30,7 +30,7 @@ fn vecu8_to_tokens(v: &[u8], span: Span2) -> TokenStream2 {
 #[allow(clippy::too_many_lines)]
 pub fn static_regex(input: TokenStream) -> TokenStream {
     let regex = parse_macro_input!(input as RegexRepr);
-    // println!("{regex:?}");
+    println!("{regex:?}");
     let hash_state = get_hash(&regex);
     let RegexRepr {
         mut body,
@@ -154,15 +154,18 @@ impl Hash for RegexRepr {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum RegexErr {
     UnexpectedEof,
+    UnclosedGroup,
     BadEscape(char),
 }
 
-impl Debug for RegexErr {
+impl Display for RegexErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedEof => write!(f, "unexpected end of regular expression"),
+            Self::UnclosedGroup => write!(f, "unclosed capture group"),
             Self::BadEscape(c) => write!(f, "bad escape sequence \"\\{c}\""),
         }
     }
@@ -175,7 +178,7 @@ impl Parse for RegexRepr {
             attrs: _,
             lit: Lit::Str(lit_str),
         }) = input.parse()? else {
-            panic!("Expected a string literal")
+            return Err(syn::Error::new(input.span(), "Expected a string literal"));
         };
 
         let pattern = lit_str.value();
@@ -184,7 +187,8 @@ impl Parse for RegexRepr {
         let mut idx = 0;
         let mut body = Vec::new();
         while idx < pattern.len() {
-            let segment = get_regex_section(&pattern, &mut idx).unwrap();
+            let segment = get_regex_section(&pattern, &mut idx)
+                .map_err(|err| syn::Error::new(span, err.to_string()))?;
             if let (Some(Segment::Str(lhs)), &Segment::Char(Character::Char(rhs))) =
                 (body.last_mut(), &segment)
             {
@@ -298,9 +302,40 @@ fn get_initial_section(s: &str, idx: &mut usize) -> Result<Segment, RegexErr> {
                 if s.chars().nth(*idx) == Some(')') {
                     break;
                 }
-                sections.push(get_regex_section(s, idx)?);
+                sections.push(get_regex_section(s, idx).map_err(|err| {
+                    if err == RegexErr::UnexpectedEof {
+                        RegexErr::UnclosedGroup
+                    } else {
+                        err
+                    }
+                })?);
             }
             Ok(Segment::Group(sections))
+        }
+        Some('[') => {
+            let mut characters = Vec::new();
+            let mut s_char_iter = s.chars().skip(*idx + 1);
+            while let Some(c) = s_char_iter.next() {
+                *idx += 1;
+                match c {
+                    ']' if !characters.is_empty() => {
+                        break;
+                    }
+                    '-' if !characters.is_empty() => {
+                        let Some(Character::Char(c)) = characters.pop() else {
+                            return Err(RegexErr::BadEscape('-'));
+                        };
+                        let Some(nxt) = s_char_iter.next() else {
+                            return Err(RegexErr::UnexpectedEof);
+                        };
+                        *idx += 1;
+                        let nxt = nxt as u8;
+                        characters.push(Character::Range(c, nxt));
+                    }
+                    c => characters.push(Character::Char(c as u8)),
+                }
+            }
+            Ok(Segment::Bracket(characters))
         }
         Some(c @ (')' | '{' | '}' | ']' | '+' | '*' | '?')) => Err(RegexErr::BadEscape(c)),
         Some(c) => Ok(Segment::Char(Character::Char(c.try_into().unwrap()))),
@@ -388,6 +423,7 @@ enum Segment {
     Char(Character),
     Quantified(Box<Segment>, Quantity),
     Group(Vec<Segment>),
+    Bracket(Vec<Character>),
     Start,
     End,
     Boundary,
@@ -647,6 +683,35 @@ impl Segment {
                     #next
                 }
             }
+            Self::Bracket(options) => {
+                let next = if next.is_empty() {
+                    on_success
+                } else {
+                    let next_segment = next.remove(0);
+                    next_segment.compile(
+                        hash_state,
+                        on_fail.clone(),
+                        on_success,
+                        span,
+                        end_length,
+                        next,
+                    )
+                };
+                let mut c_comp = quote! {};
+                for c in options {
+                    if !c_comp.is_empty() {
+                        c_comp.extend(quote! {||});
+                    }
+                    c_comp.extend(c.compile());
+                }
+                quote! {
+                    if !(#c_comp) {
+                        #on_fail
+                    }
+                    idx += 1;
+                    #next
+                }
+            }
         }
     }
 }
@@ -661,7 +726,7 @@ struct Quantity {
 enum Character {
     Char(u8),
     Any,
-    Range(char, char),
+    Range(u8, u8),
     Space,
     Word,
     Digit,
@@ -677,7 +742,7 @@ impl Character {
             Self::Char(c) => quote! {#src_nth == Some(#c)},
             Self::Any => quote! {true},
             Self::Range(l, r) => {
-                quote! {#src_nth.is_some_and(|c| #l <= c && #r >= c)}
+                quote! {#src_nth.is_some_and(|c| (#l..=#r).contains(&c))}
             }
             Self::Space => quote! {#src_nth.is_some_and(CharacterClasses::is_space)},
             Self::NonSpace => quote! {#src_nth.is_some_and(CharacterClasses::is_not_space)},
